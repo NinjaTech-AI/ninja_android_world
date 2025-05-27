@@ -39,6 +39,8 @@ from android_world.agents import t3a
 from android_world.env import env_launcher
 from android_world.env import interface
 
+from android_world.agents import ninja_android_agent
+
 logging.set_verbosity(logging.WARNING)
 
 os.environ['GRPC_VERBOSITY'] = 'ERROR'  # Only show errors
@@ -178,6 +180,8 @@ def _get_agent(
   # SeeAct.
   elif _AGENT_NAME.value == 'seeact':
     agent = seeact.SeeAct(env)
+  elif _AGENT_NAME.value == 'ninja_android_agent':
+    agent = ninja_android_agent.NinjaAndroidAgent(env)
 
   if not agent:
     raise ValueError(f'Unknown agent: {_AGENT_NAME.value}')
