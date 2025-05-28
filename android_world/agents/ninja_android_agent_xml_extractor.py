@@ -137,6 +137,10 @@ def parse_xml_hierarchy(xml_string):
             'path': path
         }
         
+        # Todo: Add check for SeekBar elements 
+        #if 'SeekBar' in element_class:  # Add this condition
+        #    clickable_elements.append(element_repr)
+
         # Check for clickable elements
         if element.get('clickable') == 'true':
             clickable_elements.append(element_repr)

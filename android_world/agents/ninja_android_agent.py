@@ -8,6 +8,7 @@ import asyncio
 import base64
 import json
 import logging
+import io
 import os
 import re
 import sys
@@ -153,15 +154,46 @@ Screenshot Description: ...
 {action}"""
 
 # define parameters
-IMAGE_BUFFER_SIZE = 5
+IMAGE_BUFFER_SIZE = 10
+# Hardcoded screen resolution
 WIDTH = 1080
 HEIGHT = 2400
+# Reduce image size to reduce token usage of UI-TARS and the general model
+RESIZE_FACTOR = 0.5
 
-
+#def base64_encode_image(image_path):
+#    with open(image_path, "rb") as image_file:
+#        return base64.b64encode(image_file.read()).decode("utf-8")
+# updated encoded with image resize
 def base64_encode_image(image_path):
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode("utf-8")
-
+    try:
+        # Open image with PIL
+        with Image.open(image_path) as img:
+            # Convert to RGB if needed (in case of RGBA or other formats)
+            if img.mode in ('RGBA', 'P'):
+                img = img.convert('RGB')
+            
+            # Get current dimensions
+            width, height = img.size
+            
+            # Calculate new dimensions
+            new_width = int(width * RESIZE_FACTOR)
+            new_height = int(height * RESIZE_FACTOR)
+            
+            # Resize image
+            resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            
+            # Save to bytes buffer as JPEG
+            buffer = io.BytesIO()
+            resized_img.save(buffer, format='JPEG', quality=95)
+            
+            # Encode to base64
+            return base64.b64encode(buffer.getvalue()).decode("utf-8")
+    except Exception as e:
+        print(f"Error processing image {image_path}: {str(e)}")
+        # Fallback to original function if resize fails
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode("utf-8")
 
 def add_box_token(input_string) -> str:
     # Step 1: Split the string into individual actions
@@ -211,9 +243,6 @@ def execute_action(
             - str | None: Action name if parsed successfully, None otherwise
             - str | None: Error message if parsing failed, None if parsing successful (regardless of execution success)
     """
-    # Hardcoded screen dimensions
-    WIDTH = 1080
-    HEIGHT = 2400
 
     # Parse the function call
     try:
@@ -443,10 +472,8 @@ def get_top_actions(predictions: list[str]):
 
 
 def revert_coordinate(screen_x: int, screen_y: int):
-    width = 1080
-    height = 2400
-    model_x = int(screen_x * 1000 / width)
-    model_y = int(screen_y * 1000 / height)
+    model_x = int(screen_x * 1000 / WIDTH)
+    model_y = int(screen_y * 1000 / HEIGHT)
     return model_x, model_y
 
 # original run_single_task function in ninja_android_agent (for testing purposes)
@@ -902,9 +929,6 @@ class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
             #    return
             #else:
             #    print("successfully connected with the android phone")
-                
-            # Initialize state
-            self.reset()
 
     def reset(self, go_home: bool = True) -> None:
             """Resets the agent state."""
@@ -926,6 +950,7 @@ class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
             
             # create a directory to store the screenshots
             self.screenshot_log_path = self.log_dir / "screenshots"
+            print(f'screenshot_log_path={self.screenshot_log_path}')
             self.screenshot_log_path.mkdir(parents=True, exist_ok=True)
 
     def step(self, goal: str) -> base_agent.AgentInteractionResult:

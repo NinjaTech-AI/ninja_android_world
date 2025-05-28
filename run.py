@@ -36,10 +36,12 @@ from android_world.agents import m3a
 from android_world.agents import random_agent
 from android_world.agents import seeact
 from android_world.agents import t3a
+from android_world.agents import ninja_android_agent
+
 from android_world.env import env_launcher
 from android_world.env import interface
 
-from android_world.agents import ninja_android_agent
+
 
 logging.set_verbosity(logging.WARNING)
 
