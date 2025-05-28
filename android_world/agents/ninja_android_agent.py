@@ -13,17 +13,15 @@ import os
 import re
 import sys
 import time
+import numpy as np
+
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
-from android_world.agents import agent_utils
 from android_world.agents import base_agent
-from android_world.agents import infer
-from android_world.agents import m3a_utils
 from android_world.env import interface
-from android_world.env import json_action
-from android_world.env import representation_utils
+from android_world.env import adb_utils
 
 from openai import AsyncOpenAI, OpenAI
 from PIL import Image
@@ -161,39 +159,53 @@ HEIGHT = 2400
 # Reduce image size to reduce token usage of UI-TARS and the general model
 RESIZE_FACTOR = 0.5
 
-#def base64_encode_image(image_path):
-#    with open(image_path, "rb") as image_file:
-#        return base64.b64encode(image_file.read()).decode("utf-8")
-# updated encoded with image resize
-def base64_encode_image(image_path):
+def base64_encode_image(image_source, resize_factor: float = RESIZE_FACTOR):
+    """Encode image to base64 string with optional resizing.
+    
+    Args:
+        image_source: Either a path to image file (str/Path) or numpy array (state.pixels)
+        resize_factor: Factor to resize image by (default RESIZE_FACTOR). If 1, no resize is performed.
+        
+    Returns:
+        str: Base64 encoded image string
+        
+    Raises:
+        ValueError: If image_source is invalid or image processing fails
+    """
     try:
-        # Open image with PIL
-        with Image.open(image_path) as img:
-            # Convert to RGB if needed (in case of RGBA or other formats)
-            if img.mode in ('RGBA', 'P'):
-                img = img.convert('RGB')
-            
-            # Get current dimensions
-            width, height = img.size
-            
+        # Handle numpy array (state.pixels)
+        if isinstance(image_source, np.ndarray):
+            img = Image.fromarray(image_source)
+        # Handle file path
+        elif isinstance(image_source, (str, Path)):
+            img = Image.open(image_source)
+        else:
+            raise ValueError(f"Unsupported image source type: {type(image_source)}")
+
+        # Convert to RGB if needed
+        if img.mode in ('RGBA', 'P'):
+            img = img.convert('RGB')
+        
+        # Only resize if factor is not 1
+        if resize_factor != 1:
             # Calculate new dimensions
-            new_width = int(width * RESIZE_FACTOR)
-            new_height = int(height * RESIZE_FACTOR)
+            width, height = img.size
+            new_width = int(width * resize_factor)
+            new_height = int(height * resize_factor)
             
             # Resize image
-            resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            
-            # Save to bytes buffer as JPEG
-            buffer = io.BytesIO()
-            resized_img.save(buffer, format='JPEG', quality=95)
-            
-            # Encode to base64
-            return base64.b64encode(buffer.getvalue()).decode("utf-8")
+            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        
+        # Save to bytes buffer
+        buffer = io.BytesIO()
+        img.save(buffer, format='JPEG', quality=95)
+        
+        # Encode to base64
+        return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
     except Exception as e:
-        print(f"Error processing image {image_path}: {str(e)}")
-        # Fallback to original function if resize fails
-        with open(image_path, "rb") as image_file:
-            return base64.b64encode(image_file.read()).decode("utf-8")
+        raise ValueError(f"Failed to process image: {str(e)}")
+
 
 def add_box_token(input_string) -> str:
     # Step 1: Split the string into individual actions
@@ -228,12 +240,10 @@ def escape_single_quotes(text: str):
     pattern = r"(?<!\\)'"
     return re.sub(pattern, r"\\'", text)
 
-
-def execute_action(
+# execute action directory through adb command.
+def execute_action_adb(
     adb_connection: ADBConnection,
-    action: str,
-    screenshot_path: str,
-    iter_number: int,
+    action: str
 ) -> tuple[bool, str | None, str | None]:
     """
     Parses the response string and executes the corresponding function.
@@ -408,7 +418,6 @@ def execute_action(
     except Exception as e:
         return False, None, f"Error parsing action: {e}"
 
-
 @dataclass
 class ChatResponse:
     mode: str
@@ -476,419 +485,6 @@ def revert_coordinate(screen_x: int, screen_y: int):
     model_y = int(screen_y * 1000 / HEIGHT)
     return model_x, model_y
 
-# original run_single_task function in ninja_android_agent (for testing purposes)
-# github.com:NinjaTech-AI/ninja-android-agent.git
-def run_single_task(
-    instruction: str,
-    run_name: str = "test",
-    log_root: str = "logs",
-    task_id: str = None,
-    max_steps: int = 50,
-    adb_connection=None,
-    base_url: str = "https://api.runpod.ai/v2/vn71d606be7ixc/openai/v1",
-    ui_tar_model_name: str = "bytedance-research/UI-TARS-72B-DPO",
-):
-    history_base64_images = []
-    history_image_memory: list[str] = []
-    history_actions: list[str] = []
-    history_thoughts: list[str] = []
-    history_predictions: list[str] = []
-
-    # define model
-    worker_async_agent = AsyncOpenAI(
-        base_url=base_url,
-        api_key=os.environ.get("UI_TARS_API_KEY"),
-    )
-    general_async_agent = AsyncOpenAI()
-    general_sync_agent = OpenAI()
-
-    if adb_connection is None:
-        adb_connection = ADBConnection()
-
-    # initialise by loading the current home screen
-    if adb_connection.check_adb_connection_with_reconnect() is False:
-        print("problem connecting with the android phone")
-        return
-    else:
-        print("successfully connected with the android phone")
-
-    ### set up log dir ###
-    log_dir = Path(log_root)
-    if not task_id:
-        task_id = "test"
-    log_dir = log_dir / task_id
-    setup_logging(log_dir)
-
-    # create a directory to store the screenshots
-    screenshot_log_path = log_dir / "screenshots"
-    screenshot_log_path.mkdir(parents=True, exist_ok=True)
-
-    steps_info = []
-    recorded_time = []
-    
-    # always press home button before starting a new task
-    home(adb_connection)
-
-    task_start_time = time.time()
-    step = 0
-    messages: list[dict] = []
-    while True:
-        # stop if reaching the maximum limit
-        if step > max_steps:
-            task_end_time = time.time()
-            new_message = f"Task finished prematurely: {max_steps} iterations reached maximum limit. Total duration {(task_end_time - task_start_time):.1f} s"
-            print(new_message)
-            return
-
-        step_info = {
-            "step": step,
-            "task": instruction,
-            "thought": "",
-            "initial_action": "",
-            "correct_action": "",
-            "memory": "",
-            "step_time": 0.0,
-            "average_step_time": 0.0,
-            "total_time": 0.0,
-        }
-
-        # get the latest phone screenshot
-        get_screenshot(adb_connection)
-        screenshot_file = f"{adb_connection.get_screenshot_dir()}/screenshot.jpg"
-        base64_image = base64_encode_image(screenshot_file)
-
-        # save the latest phone screenshot
-        Image.open(screenshot_file).save(screenshot_log_path / f"{step}.jpg")
-
-        # save the base64 encoded image into history
-        history_base64_images.append(base64_image)
-
-        if step == 0:
-            memory_template = MEMORY_TEMPLATE_INITIAL.format(instruction=instruction)
-            # append the initial user query
-            messages.append(
-                {
-                    "role": "user",
-                    "content": MOBILE_PROMPT_TEMPLATE.format(
-                        language="English",
-                        instruction=instruction,
-                        action_space=ACTION_SPCAE,
-                    ),
-                }
-            )
-        else:
-            memory_template = MEMORY_TEMPLATE.format(
-                instruction=instruction,
-                thought=history_thoughts[-1],
-                action=history_actions[-1],
-            )
-
-        # append the latest base64 image code into messages
-        messages.append(
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
-                    }
-                ],
-            }
-        )
-
-        if len(history_base64_images) > IMAGE_BUFFER_SIZE:
-            # remove the second item in the messages that contains the role "user"
-            for i in range(1, len(messages)):
-                if messages[i]["role"] == "user" and messages[i]["content"][0]["type"] == "image_url":
-                    del messages[i]
-                    break
-
-        # record the step time
-        step_time_duration = 0.0
-
-        # model prediction
-        async def generate_all_completions():
-            tasks = []
-            chat_history = []
-            for model_name in [ui_tar_model_name, "gpt-4o"]:
-                if model_name == "gpt-4o":
-                    client = general_async_agent
-                    temperature = 0.0
-                    num_task = 1
-                    chat_history = [
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": memory_template,
-                                },
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{base64_image}"
-                                    },
-                                },
-                            ],
-                        }
-                    ]
-                else:
-                    client = worker_async_agent
-                    temperature = 0.2
-                    num_task = 2
-                    chat_history = messages
-
-                # add async tasks into the list
-                for _ in range(num_task):
-                    task = generate_completion(
-                        client=client,
-                        model_name=model_name,
-                        messages=chat_history,
-                        temperature=temperature,
-                    )
-                    tasks.append(task)
-
-            # Run all tasks concurrently and gather results
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            return results
-
-        # run the async tasks in the event loop
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        worker_start_time = time.time()
-        # process results
-        chat_responses: list[ChatResponse] = loop.run_until_complete(
-            generate_all_completions()
-        )
-
-        predictions: list[str] = []
-        for response in chat_responses:
-            if response.mode == "memory":
-                curr_image_memory = response.response
-
-                # process image memory response
-                curr_image_memory = curr_image_memory.split("Description:")[-1].strip()
-                if curr_image_memory.endswith("```"):
-                    curr_image_memory = curr_image_memory.rstrip("```")
-
-                # save the image content into memory
-                step_info["memory"] = curr_image_memory
-
-                # save the image content into history
-                history_image_memory.append(curr_image_memory)
-            else:
-                predictions.append(response.response)
-
-        # do majority voting
-        top_actions, action_prediction_map = get_top_actions(predictions)
-
-        # Final decision
-        if top_actions:
-            action = top_actions[0]
-            prediction = action_prediction_map[action]
-            step_info["initial_action"] = action
-            step_info["thought"] = extract_thought(prediction)
-        else:
-            raise ValueError("No selected actions")
-
-        worker_end_time = time.time()
-        worker_time_duration = worker_end_time - worker_start_time
-        step_time_duration += worker_time_duration
-
-        # extract the thought
-        thought = extract_thought(prediction)
-
-        # post processing: check if the current action is "click"
-        if "click" in action:
-            print("Running click verification...")
-
-            # apply the xml
-            get_xml(adb_connection)
-            xml_fp = f"{adb_connection.get_xml_dir()}/window_dump.xml"
-            xml_content = rule_based_extractor(xml_fp)
-            click_check_prompt = f"""\
-You are an AI agent to help me decide the next action for interacting with an Android phone. Given the thought and action type, your job is to examine from interactive actions and choose the correct action according to the action type and thought.
-
-## Thought
-{thought}
-
-## Action Type
-click
-
-## Interactive Actions
-{xml_content}
-
-Return the answer following the output format:
-Action: ...
-"""
-            # print(click_check_prompt)
-            action_correct_start = time.time()
-            action_response = general_sync_agent.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": click_check_prompt}],
-                temperature=0.0,
-            )
-
-            action_correct_duration = time.time() - action_correct_start
-            step_time_duration += action_correct_duration
-
-            action_response = action_response.choices[0].message.content.strip()
-            print(f"Corrected Action:\n{action_response}")
-            try:
-                # extract the coordinates from model response
-                match = re.search(r"Action:\s*click,(\d+),(\d+)", action_response)
-                screen_x, screen_y = match.groups()
-                model_x, model_y = revert_coordinate(int(screen_x), int(screen_y))
-                action = f"click(start_box='({model_x},{model_y})')"
-            except:
-                print(
-                    "[Action verification and correction failed due to regex pattern error]"
-                )
-
-            # update the prediction
-            prediction = f"Thought: {thought}\nAction: {action}"
-            step_info["correct_action"] = action
-
-        # post processing: verify the typing content
-        elif "type" in action:
-            print(f"Running typing content verification...")
-
-            formatted_memory = "\n".join(
-                f"  {i+1}. {item}" for i, item in enumerate(history_image_memory)
-            )
-
-            # check if the content
-            typing_content_prompt = f"""\
-You are a helpful Android mobile agent. Your job is to improve or complete a `type(content=...)` action proposed by an LLM, based on the task, its thought and the screen context.
-
-You are given:
-- A **Task**: user's input task for the mobile agent to complete.
-- A **Thought**: the reasoning step from the LLM (what it is trying to do).
-- An **Action**: the current `type(content=...)` command that may have errors or be incomplete.
-- **Image Content Memory**: extracted information from previous phone screenshots in chronological order.
-
-Your job:
-1. **If the content has typos or incorrect information**, correct them using the memory.
-2. **If the content is incomplete or vague**, enrich it using relevant phrases from the image content memory.
-3. **If the task is search-related** (e.g., inputting a query), append `\\n` to the content to simulate a "submit" action.
-
-This prompt only applies to `type(content=...)` actions.
-
-Now, complete the output below:
-
-Task:
-{instruction}
-
-Thought:
-{thought}
-
-Action:
-{action}
-
-Image Content Memory:
-{formatted_memory}
-
----
-
-Output Format:
-type(content='your corrected or enriched content here')
-"""
-            print(f"Typing verifier template:\n{typing_content_prompt}\n")
-
-            type_verifier_start = time.time()
-            response = general_sync_agent.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": typing_content_prompt}],
-                temperature=0.0,
-            )
-            type_verifier_duration = time.time() - type_verifier_start
-            step_time_duration += type_verifier_duration
-
-            try:
-                action = response.choices[0].message.content.strip()
-                match = re.search(r"type\(content='.*?'\)", action, re.DOTALL)
-                action = match.group(0)
-            except:
-                print("[Typing content verification failed due to regex pattern error]")
-
-            print(f"Typing verifier corrected action:\n{action}\n")
-
-            # update the prediction
-            prediction = f"Thought: {thought}\nAction: {action}"
-            # update the action
-            step_info["correct_action"] = action
-
-        # save the thought into history
-        history_thoughts.append(thought)
-        # save the correct action into history
-        history_actions.append(action)
-        # save prediction into history
-        history_predictions.append(add_box_token(prediction))
-
-        # === parse and execute the action === #
-        android_start_time = time.time()
-        success, action_name, error_msg = execute_action(
-            adb_connection,
-            action,
-            screenshot_file,
-            step,
-        )
-        android_end_time = time.time()
-        android_duration = android_end_time - android_start_time
-        step_time_duration += android_duration
-        # append the step time
-        recorded_time.append(step_time_duration)
-
-        if success and (action_name is not None):
-            if action_name.startswith("finish"):
-                task_end_time = time.time()
-                step_info["total_time"] = task_end_time - task_start_time
-                step_info["average_step_time"] = sum(recorded_time) / len(recorded_time)
-                step_info["step_time"] = step_time_duration
-
-                steps_info.append(step_info)
-                with open(log_dir / "trajectory.json", "w") as f:
-                    json.dump(steps_info, f, indent=4)
-                return
-            else:
-                # wait for 5s for the screen to load
-                time.sleep(5)
-
-                step_info["step_time"] = step_time_duration
-                steps_info.append(step_info)
-                with open(log_dir / "trajectory.json", "w") as f:
-                    json.dump(steps_info, f, indent=4)
-
-                # update gradio history
-                new_message = f"Successfully executed {action_name} | Android execution time = {android_duration:.2f} s"
-                print(new_message)
-
-                # append the thought and action for next iteration
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": history_predictions[-1],
-                    }
-                )
-
-                # update the running step
-                step += 1
-                continue
-        elif not success and action_name is not None:
-            new_message = f"Problem encountered when executing {action_name} (latency = {(android_end_time - android_start_time):.2f} s)"
-        else:
-            new_message = f"Exception due to {error_msg}."
-        print(new_message)
-
-
-if __name__ == "__main__":
-    task = "Turn brightness to the 100% value."
-    run_single_task(instruction=task, max_steps=50, adb_connection=ADBConnection())
-
 class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
     """Ninja Android agent, fast scaffold based on UI-TARS"""
 
@@ -953,6 +549,102 @@ class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
             print(f'screenshot_log_path={self.screenshot_log_path}')
             self.screenshot_log_path.mkdir(parents=True, exist_ok=True)
 
+    def execute_action_env(self, action: str) -> tuple[bool, str | None, str | None]:
+        """Executes action using environment interface.
+        
+        Args:
+            action: Action string in NinjaAndroid format
+            
+        Returns:
+            tuple[bool, str | None, str | None]:
+                - bool: True if action was successfully executed
+                - str | None: Action name if parsed successfully
+                - str | None: Error message if failed
+        """
+        try:
+            # Get screen dimensions
+            WIDTH, HEIGHT = self.env.logical_screen_size
+
+            if "click" in action:
+                coord_match = re.search(r"start_box='\((\d+),(\d+)\)'", action)
+                if coord_match:
+                    x = int(coord_match.group(1))
+                    y = int(coord_match.group(2))
+                    
+                    # Normalize coordinates from 1000-based to actual screen dimensions
+                    normalized_x = int(x * WIDTH / 1000)
+                    normalized_y = int(y * HEIGHT / 1000)
+                    
+                    adb_utils.tap_screen(normalized_x, normalized_y, self.env.controller)
+                    return True, f"tap({normalized_x}, {normalized_y})", None
+
+            elif "type" in action:
+                match = re.search(r"type\(content='(.*?)'\)", action)
+                if match:
+                    text = match.group(1)
+                    adb_utils.type_text(text, self.env.controller)
+                    if text.endswith("\n"):
+                        adb_utils.press_enter_button(self.env.controller)
+                    return True, f"type({text})", None
+
+            elif "scroll" in action:
+                start_coord_match = re.search(r"start_box='\((\d+),(\d+)\)'", action)
+                end_coord_match = re.search(r"end_box='\((\d+),(\d+)\)'", action)
+                if start_coord_match and end_coord_match:
+                    x1 = int(start_coord_match.group(1))
+                    y1 = int(start_coord_match.group(2))
+                    x2 = int(end_coord_match.group(1))
+                    y2 = int(end_coord_match.group(2))
+                    
+                    # Normalize coordinates
+                    normalized_x1 = int(x1 * WIDTH / 1000)
+                    normalized_y1 = int(y1 * HEIGHT / 1000)
+                    normalized_x2 = int(x2 * WIDTH / 1000)
+                    normalized_y2 = int(y2 * HEIGHT / 1000)
+                    
+                    command = adb_utils.generate_swipe_command(
+                        normalized_x1, normalized_y1, 
+                        normalized_x2, normalized_y2
+                    )
+                    adb_utils.issue_generic_request(command, self.env.controller)
+                    return True, f"swipe({normalized_x1}, {normalized_y1}, {normalized_x2}, {normalized_y2})", None
+
+            elif "long_press" in action:
+                coord_match = re.search(r"start_box='\((\d+),(\d+)\)'", action)
+                if coord_match:
+                    x = int(coord_match.group(1))
+                    y = int(coord_match.group(2))
+                    
+                    # Normalize coordinates
+                    normalized_x = int(x * WIDTH / 1000)
+                    normalized_y = int(y * HEIGHT / 1000)
+                    
+                    adb_utils.long_press(normalized_x, normalized_y, self.env.controller)
+                    return True, f"long_press({normalized_x}, {normalized_y})", None
+
+            elif "finished" in action:
+                return True, "finish", None
+
+            elif "press_home" in action:
+                adb_utils.press_home_button(self.env.controller)
+                return True, "home", None
+
+            elif "press_back" in action:
+                adb_utils.press_back_button(self.env.controller)
+                return True, "back", None
+
+            elif "open_app" in action:
+                match = re.search(r"app_name=['\"]([^'\"]+)['\"]", action)
+                if match:
+                    app_name = match.group(1)
+                    adb_utils.launch_app(app_name, self.env.controller)
+                    return True, f"open_app({app_name})", None
+
+            return False, None, f"Action {action} not recognized or not implemented"
+
+        except Exception as e:
+            return False, None, f"Error executing action: {str(e)}"
+
     def step(self, goal: str) -> base_agent.AgentInteractionResult:
         """Performs one step of interaction.
 
@@ -978,15 +670,18 @@ class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
 
         # Todo, use the base_agent's supporting function to retrieve the phone state
         # where is also handle the transition consistently??
-        # state = self.get_post_transition_state()
-        # logical_screen_size = self.env.logical_screen_size
-        get_screenshot(self.adb_connection)
-        screenshot_file = f"{self.adb_connection.get_screenshot_dir()}/screenshot.jpg"
-        base64_image = base64_encode_image(screenshot_file)
+        state = self.env.get_state(wait_to_stabilize=False)
+        # Get screenshot and encode
+        screenshot = state.pixels.copy()
+        base64_image = base64_encode_image(screenshot)
         step = len(self.steps_info)
 
-         # save the latest phone screenshot
-        Image.open(screenshot_file).save(self.screenshot_log_path / f"{step}.jpg")
+         # save the latest phone screenshot (for easier debug)
+        Image.fromarray(screenshot).save(
+            self.screenshot_log_path / f"{step}.jpg",
+            format='JPEG',
+            quality=95
+        )
 
         # save the base64 encoded image into history
         self.history_base64_images.append(base64_image)
@@ -1262,12 +957,7 @@ type(content='your corrected or enriched content here')
 
         # === parse and execute the action === #
         android_start_time = time.time()
-        success, action_name, error_msg = execute_action(
-            self.adb_connection,
-            action,
-            screenshot_file,
-            step,
-        )
+        success, action_name, error_msg = self.execute_action_env(action)
         android_end_time = time.time()
         android_duration = android_end_time - android_start_time
         step_time_duration += android_duration
