@@ -392,10 +392,6 @@ class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
 
                 action_name = f"type({text})"
                 adb_utils.type_text(text, self.env.controller)
-
-                if text.endswith("\n"):
-                    adb_utils.press_enter_button(self.env.controller)
-
                 return True, action_name, None
 
             elif "scroll" in action:
@@ -436,6 +432,31 @@ class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
             elif "wait" in action:
                 time.sleep(2.0)
                 return True, "wait()", None
+            
+            elif "hotkey" in action:
+                if "enter" in action:
+                    adb_utils.press_enter_button(self.env.controller)
+                    return True, "hotkey(key='enter')", None
+                elif "back" in action:
+                    adb_utils.press_back_button(self.env.controller)
+                    return True, "hotkey(key='back')", None
+                elif "home" in action:
+                    adb_utils.press_home_button(self.env.controller)
+                    return True, "hotkey(key='home')", None
+                elif "backspace" in action:
+                    adb_utils.press_keyboard_generic('KEYCODE_DEL', self.env.controller)
+                    return True, "hotkey(key='backspace')", None
+                elif "delete" in action:
+                    adb_utils.press_keyboard_generic('KEYCODE_FORWARD_DEL', self.env.controller)
+                    return True, "hotkey(key='delete')", None
+                elif "volume_up" in action:
+                    adb_utils.press_keyboard_generic('KEYCODE_VOLUME_UP', self.env.controller)
+                    return True, "hotkey(key='volume_up')", None
+                elif "volume_down" in action:
+                    adb_utils.press_keyboard_generic('KEYCODE_VOLUME_DOWN', self.env.controller)
+                    return True, "hotkey(key='volume_down')", None
+                else:
+                    return False, None, f"Action {action} not recognized."
 
             elif "finished" in action:
                 return True, "finish", None
@@ -736,7 +757,7 @@ Image Content Memory:
 Output Format:
 type(content='your corrected or enriched content here')
 """
-            logging.warning(f"Typing verifier template:\n{typing_content_prompt}\n")
+            #logging.warning(f"Typing verifier template:\n{typing_content_prompt}\n")
 
             type_verifier_start = time.time()
             response = self.general_sync_agent.chat.completions.create(
