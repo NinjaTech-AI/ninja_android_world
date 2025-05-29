@@ -433,6 +433,10 @@ class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
                     adb_utils.long_press(normalized_x, normalized_y, self.env.controller)
                     return True, f"long_press({normalized_x}, {normalized_y})", None
 
+            elif "wait" in action:
+                time.sleep(2.0)
+                return True, "wait()", None
+
             elif "finished" in action:
                 return True, "finish", None
 
@@ -476,7 +480,7 @@ class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
             "memory": "",
             "step_time": 0.0,
             "average_step_time": 0.0,
-            "total_time": 0.0,
+            "step": 0.0,
         }
 
         # Todo, use the base_agent's supporting function to retrieve the phone state
@@ -486,6 +490,7 @@ class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
         screenshot = state.pixels.copy()
         base64_image = base64_encode_image(screenshot)
         step = len(self.steps_info)
+        step_info['step'] = step
 
          # save the latest phone screenshot (for easier debug)
         Image.fromarray(screenshot).save(
