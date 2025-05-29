@@ -18,7 +18,7 @@ import dataclasses
 from typing import Any, Optional
 import xml.etree.ElementTree as ET
 from android_env.proto.a11y import android_accessibility_forest_pb2
-
+from absl import logging
 
 @dataclasses.dataclass
 class BoundingBox:
@@ -160,6 +160,7 @@ def forest_to_ui_elements(
           continue
         else:
           elements.append(accessibility_node_to_ui_element(node, screen_size))
+  logging.warning(f"Number of Extracted Elements:{len(elements)}")
   return elements
 
 

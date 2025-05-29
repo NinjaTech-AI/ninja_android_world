@@ -7,7 +7,6 @@ load_dotenv(override=True)
 import asyncio
 import base64
 import json
-import logging
 import io
 import os
 import re
@@ -18,82 +17,15 @@ import numpy as np
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from absl import logging
 
 from android_world.agents import base_agent
 from android_world.env import interface
 from android_world.env import adb_utils
+from android_world.env import representation_utils
 
 from openai import AsyncOpenAI, OpenAI
 from PIL import Image
-
-from android_world.agents.ninja_android_agent_controller import (
-    ADBConnection,
-    back,
-    backspace,
-    delete,
-    enter,
-    get_screenshot,
-    get_xml,
-    home,
-    open_app_with_name,
-    swipe,
-    tap,
-    type,
-    volume_down,
-    volume_up,
-)
-
-from android_world.agents.ninja_android_agent_xml_extractor import rule_based_extractor
-
-
-
-## setup log
-logger = logging.getLogger("agent_ui_tars")
-logger.setLevel(logging.DEBUG)
-# Global formatter definitions
-stdout_formatter = logging.Formatter(
-    fmt="\x1b[1;33m[%(asctime)s \x1b[31m%(levelname)s \x1b[32m%(module)s/%(lineno)d-%(processName)s\x1b[1;33m] \x1b[0m%(message)s"
-)
-file_formatter = logging.Formatter(
-    fmt="[%(asctime)s %(levelname)s %(module)s/%(lineno)d-%(processName)s] %(message)s"
-)
-
-
-# have new log files given log directory (e.g. set based task id )
-def setup_logging(log_dir):
-    # Store the stdout handler if it exists
-    stdout_handler = None
-    for handler in logger.handlers[:]:
-        if isinstance(handler, logging.StreamHandler) and handler.stream == sys.stdout:
-            stdout_handler = handler
-        logger.removeHandler(handler)
-
-    # Recreate stdout handler if it didn't exist before
-    if stdout_handler is None:
-        stdout_handler = logging.StreamHandler(sys.stdout)
-        stdout_handler.setLevel(logging.INFO)
-        stdout_handler.setFormatter(stdout_formatter)
-
-    # Add back the stdout handler
-    logger.addHandler(stdout_handler)
-
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create new handlers
-    file_info_handler = logging.FileHandler(log_dir / "info.log", encoding="utf-8")
-
-    file_debug_handler = logging.FileHandler(log_dir / "debug.log", encoding="utf-8")
-
-    file_info_handler.setLevel(logging.INFO)
-    file_debug_handler.setLevel(logging.DEBUG)
-
-    file_info_handler.setFormatter(file_formatter)
-    file_debug_handler.setFormatter(file_formatter)
-
-    # Add new handlers
-    logger.addHandler(file_info_handler)
-    logger.addHandler(file_debug_handler)
-
 
 ACTION_SPCAE = """\
 click(start_box='<|box_start|>(x1, y1)<|box_end|>')
@@ -153,9 +85,6 @@ Screenshot Description: ...
 
 # define parameters
 IMAGE_BUFFER_SIZE = 10
-# Hardcoded screen resolution
-WIDTH = 1080
-HEIGHT = 2400
 # Reduce image size to reduce token usage of UI-TARS and the general model
 RESIZE_FACTOR = 0.5
 
@@ -206,7 +135,6 @@ def base64_encode_image(image_source, resize_factor: float = RESIZE_FACTOR):
     except Exception as e:
         raise ValueError(f"Failed to process image: {str(e)}")
 
-
 def add_box_token(input_string) -> str:
     # Step 1: Split the string into individual actions
     if "Action: " in input_string and "start_box=" in input_string:
@@ -235,188 +163,9 @@ def add_box_token(input_string) -> str:
         final_string = input_string
     return final_string
 
-
 def escape_single_quotes(text: str):
     pattern = r"(?<!\\)'"
     return re.sub(pattern, r"\\'", text)
-
-# execute action directory through adb command.
-def execute_action_adb(
-    adb_connection: ADBConnection,
-    action: str
-) -> tuple[bool, str | None, str | None]:
-    """
-    Parses the response string and executes the corresponding function.
-    Returns:
-        tuple[bool, str | None, str | None]:
-            - bool: True if action was successfully executed, False otherwise
-            - str | None: Action name if parsed successfully, None otherwise
-            - str | None: Error message if parsing failed, None if parsing successful (regardless of execution success)
-    """
-
-    # Parse the function call
-    try:
-        if "click" in action:
-            coord_match = re.search(r"start_box='\((\d+),(\d+)\)'", action)
-            if coord_match:
-                # Extract and normalize coordinates
-                x = int(coord_match.group(1))
-                y = int(coord_match.group(2))
-
-                # Normalize coordinates
-                normalized_x = int(x * WIDTH / 1000)
-                normalized_y = int(y * HEIGHT / 1000)
-
-                action_name = f"tap({normalized_x}, {normalized_y})"
-                tap(adb_connection, normalized_x, normalized_y)
-                return True, action_name, None
-            else:
-                return False, None, "Could not parse coordinates from action"
-
-        elif "long_press" in action:
-            # Extract coordinates from the parameters
-            coord_match = re.search(r"start_box='\((\d+),(\d+)\)'", action)
-            if coord_match:
-                x = int(coord_match.group(1))
-                y = int(coord_match.group(2))
-
-                # Normalize coordinates
-                normalized_x = int(x * WIDTH / 1000)
-                normalized_y = int(y * HEIGHT / 1000)
-
-                # For long press, start and end coordinates are the same
-                action_name = f"swipe({normalized_x}, {normalized_y}, {normalized_x}, {normalized_y})"
-                swipe(
-                    adb_connection,
-                    normalized_x,
-                    normalized_y,
-                    normalized_x,
-                    normalized_y,
-                    time=1500,
-                )
-                return True, action_name, None
-            else:
-                return False, None, "Could not parse coordinates from long_press action"
-
-        elif "scroll" in action:
-            start_coord_match = re.search(r"start_box='\((\d+),(\d+)\)'", action)
-            end_coord_match = re.search(r"end_box='\((\d+),(\d+)\)'", action)
-            if start_coord_match and end_coord_match:
-                x_start = int(start_coord_match.group(1))
-                y_start = int(start_coord_match.group(2))
-                x_end = int(end_coord_match.group(1))
-                y_end = int(end_coord_match.group(2))
-
-                # Normalize coordinates
-                x1 = int(x_start * WIDTH / 1000)
-                y1 = int(y_start * HEIGHT / 1000)
-
-                x2 = int(x_end * WIDTH / 1000)
-                y2 = int(y_end * HEIGHT / 1000)
-
-                action_name = f"swipe({x1}, {y1}, {x2}, {y2})"
-                swipe(adb_connection, x1, y1, x2, y2)
-                return True, action_name, None
-
-            return False, None, "Could not parse coordinates from drag action"
-
-        elif "finished" in action:
-            content_match = re.search(r"content=['\"]([^'\"]+)['\"]", action)
-            if content_match:
-                content = content_match.group(1)
-                return True, f"finish({content})", None
-            else:
-                return True, "finish", None
-
-        elif "press_home()" in action:
-            action_name = "home()"
-            home(adb_connection)
-            return True, action_name, None
-
-        elif "press_back()" in action:
-            action_name = "back()"
-            back(adb_connection)
-            return True, action_name, None
-
-        elif "open_app" in action:
-            # Extract app name from the parameters
-            app_name_match = re.search(r"app_name=['\"]([^'\"]+)['\"]", action)
-            if app_name_match:
-                app_name = app_name_match.group(1)
-
-                # hardcode for now
-                if "music" in app_name.lower():
-                    app_name = "music"
-                elif "book" in app_name.lower():
-                    app_name = "booking"
-                elif "news" in app_name.lower():
-                    app_name = "news"
-                elif "note" in app_name.lower():
-                    app_name = "notes"
-
-                action_name = f"open_app_with_name({app_name})"
-                try:
-                    success = open_app_with_name(adb_connection, app_name)
-                    return True, action_name, None
-                except RuntimeError as e:
-                    return False, action_name, str(e)
-            else:
-                return False, None, "Could not parse app name from action"
-
-        elif "type(content" in action:
-
-            def escape_quotes(match):
-                content = match.group(1)  # get content value
-                return content
-
-            pattern = r"type\(content='(.*?)'\)"  # match type(content='...')
-            content = re.sub(pattern, escape_quotes, action)
-
-            # process string
-            text = escape_single_quotes(content)
-            print("raw text for typing is:", repr(text))
-
-            action_name = f"type({text})"
-            type(adb_connection, text)
-
-            if text.endswith("\n"):
-                enter(adb_connection)
-
-            return True, action_name, None
-
-        elif "wait" in action:
-            time.sleep(2)
-            return True, "wait()", None
-
-        elif "hotkey" in action:
-            if "enter" in action:
-                enter(adb_connection)
-                return True, "hotkey(key='enter')", None
-            elif "back" in action:
-                back(adb_connection)
-                return True, "hotkey(key='back')", None
-            elif "home" in action:
-                home(adb_connection)
-                return True, "hotkey(key='home')", None
-            elif "backspace" in action:
-                backspace(adb_connection)
-                return True, "hotkey(key='backspace')", None
-            elif "delete" in action:
-                delete(adb_connection)
-                return True, "hotkey(key='delete')", None
-            elif "volume_up" in action:
-                volume_up(adb_connection)
-                return True, "hotkey(key='volume_up')", None
-            elif "volume_down" in action:
-                volume_down(adb_connection)
-                return True, "hotkey(key='volume_down')", None
-            else:
-                return False, None, f"Action {action} not recognized."
-        else:
-            return False, None, f"Action {action} not recognized."
-
-    except Exception as e:
-        return False, None, f"Error parsing action: {e}"
 
 @dataclass
 class ChatResponse:
@@ -480,11 +229,6 @@ def get_top_actions(predictions: list[str]):
     ], action_prediction_map
 
 
-def revert_coordinate(screen_x: int, screen_y: int):
-    model_x = int(screen_x * 1000 / WIDTH)
-    model_y = int(screen_y * 1000 / HEIGHT)
-    return model_x, model_y
-
 class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
     """Ninja Android agent, fast scaffold based on UI-TARS"""
 
@@ -517,14 +261,6 @@ class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
             
             # Store parameters
             self.ui_tar_model_name = ui_tar_model_name
-                        
-            self.adb_connection = ADBConnection()
-            # check the connection, not needed for Android world??
-            #if self.adb_connection.check_adb_connection_with_reconnect() is False:
-            #    print("problem connecting with the android phone")
-            #    return
-            #else:
-            #    print("successfully connected with the android phone")
 
     def reset(self, go_home: bool = True) -> None:
             """Resets the agent state."""
@@ -546,10 +282,76 @@ class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
             
             # create a directory to store the screenshots
             self.screenshot_log_path = self.log_dir / "screenshots"
-            print(f'screenshot_log_path={self.screenshot_log_path}')
+            logging.info(f'Ninja Agent: screenshot_log_path={self.screenshot_log_path}')
             self.screenshot_log_path.mkdir(parents=True, exist_ok=True)
 
-    def execute_action_env(self, action: str) -> tuple[bool, str | None, str | None]:
+            # Set screen dimensions
+            self.WIDTH, self.HEIGHT = self.env.logical_screen_size
+    
+    def _extract_clickable_elements(self, ui_elements: list[representation_utils.UIElement]) -> str:
+        """Extract clickable elements from list of UIElements.
+        
+        Args:
+            ui_elements: List of UIElement objects from environment state
+            
+        Returns:
+            str: Formatted string containing clickable elements and their actions
+        """
+
+        # Get UI elements from environment if not provided or empty
+        if not ui_elements:
+            ui_elements = self.env.get_state(wait_to_stabilize=False).ui_elements
+
+        output = ""
+        current_id = 1
+        
+        output += "=== CLICKABLE ELEMENTS ===\n"
+        
+        for element in ui_elements:
+            if element.is_clickable:
+                # Get display text (prioritize different text sources)
+                display_text = ""
+                if element.text:
+                    display_text = element.text
+                elif element.content_description:
+                    display_text = element.content_description
+                elif element.resource_id:
+                    # Clean up resource ID similar to original function
+                    id_parts = element.resource_id.split('/')
+                    display_text = id_parts[-1] if len(id_parts) > 1 else element.resource_id
+                    
+                if display_text:
+                    display_text = f"\"{display_text}\""
+                else:
+                    continue  # Skip elements without any text
+                    
+                # Get class name
+                class_name = element.class_name if element.class_name else "android.view.View"
+                
+                # Get bounds
+                if element.bbox_pixels:
+                    bounds = f"[{int(element.bbox_pixels.x_min)},{int(element.bbox_pixels.y_min)}][{int(element.bbox_pixels.x_max)},{int(element.bbox_pixels.y_max)}]"
+                    
+                    # Calculate middle point for action
+                    middle_x = int((element.bbox_pixels.x_min + element.bbox_pixels.x_max) // 2)
+                    middle_y = int((element.bbox_pixels.y_min + element.bbox_pixels.y_max) // 2)
+                    
+                    # Format output similar to original
+                    output += f"{display_text} ({class_name})\n"
+                    output += f"Bounds: {bounds}\n"
+                    output += f"{current_id}. Action: click,{middle_x},{middle_y}\n"
+                    output += "\n"
+                    
+                    current_id += 1
+                    
+        return output
+
+    def _revert_coordinate(self, screen_x: int, screen_y: int):
+        model_x = int(screen_x * 1000 / self.WIDTH)
+        model_y = int(screen_y * 1000 / self.HEIGHT)
+        return model_x, model_y
+
+    def _execute_action_env(self, action: str) -> tuple[bool, str | None, str | None]:
         """Executes action using environment interface.
         
         Args:
@@ -562,8 +364,6 @@ class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
                 - str | None: Error message if failed
         """
         try:
-            # Get screen dimensions
-            WIDTH, HEIGHT = self.env.logical_screen_size
 
             if "click" in action:
                 coord_match = re.search(r"start_box='\((\d+),(\d+)\)'", action)
@@ -572,20 +372,31 @@ class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
                     y = int(coord_match.group(2))
                     
                     # Normalize coordinates from 1000-based to actual screen dimensions
-                    normalized_x = int(x * WIDTH / 1000)
-                    normalized_y = int(y * HEIGHT / 1000)
+                    normalized_x = int(x * self.WIDTH / 1000)
+                    normalized_y = int(y * self.HEIGHT / 1000)
                     
                     adb_utils.tap_screen(normalized_x, normalized_y, self.env.controller)
                     return True, f"tap({normalized_x}, {normalized_y})", None
 
-            elif "type" in action:
-                match = re.search(r"type\(content='(.*?)'\)", action)
-                if match:
-                    text = match.group(1)
-                    adb_utils.type_text(text, self.env.controller)
-                    if text.endswith("\n"):
-                        adb_utils.press_enter_button(self.env.controller)
-                    return True, f"type({text})", None
+            elif "type(content" in action:  # Note: using Crane's original implementation
+                def escape_quotes(match):
+                    content = match.group(1)  # get content value
+                    return content
+
+                pattern = r"type\(content='(.*?)'\)"  # match type(content='...')
+                content = re.sub(pattern, escape_quotes, action)
+
+                # process string
+                text = escape_single_quotes(content)
+                logging.info("raw text for typing is:", repr(text))
+
+                action_name = f"type({text})"
+                adb_utils.type_text(text, self.env.controller)
+
+                if text.endswith("\n"):
+                    adb_utils.press_enter_button(self.env.controller)
+
+                return True, action_name, None
 
             elif "scroll" in action:
                 start_coord_match = re.search(r"start_box='\((\d+),(\d+)\)'", action)
@@ -597,10 +408,10 @@ class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
                     y2 = int(end_coord_match.group(2))
                     
                     # Normalize coordinates
-                    normalized_x1 = int(x1 * WIDTH / 1000)
-                    normalized_y1 = int(y1 * HEIGHT / 1000)
-                    normalized_x2 = int(x2 * WIDTH / 1000)
-                    normalized_y2 = int(y2 * HEIGHT / 1000)
+                    normalized_x1 = int(x1 * self.WIDTH / 1000)
+                    normalized_y1 = int(y1 * self.HEIGHT / 1000)
+                    normalized_x2 = int(x2 * self.WIDTH / 1000)
+                    normalized_y2 = int(y2 * self.HEIGHT / 1000)
                     
                     command = adb_utils.generate_swipe_command(
                         normalized_x1, normalized_y1, 
@@ -616,8 +427,8 @@ class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
                     y = int(coord_match.group(2))
                     
                     # Normalize coordinates
-                    normalized_x = int(x * WIDTH / 1000)
-                    normalized_y = int(y * HEIGHT / 1000)
+                    normalized_x = int(x * self.WIDTH / 1000)
+                    normalized_y = int(y * self.HEIGHT / 1000)
                     
                     adb_utils.long_press(normalized_x, normalized_y, self.env.controller)
                     return True, f"long_press({normalized_x}, {normalized_y})", None
@@ -790,7 +601,7 @@ class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
         for response in chat_responses:
             # Add exception handling
             if isinstance(response, Exception):
-                print(f"Error in model response: {str(response)}")
+                logging.warning(f"Error in model response: {str(response)}")
                 continue
 
             if response.mode == "memory":
@@ -830,12 +641,9 @@ class NinjaAndroidAgent(base_agent.EnvironmentInteractingAgent):
 
         # post processing: check if the current action is "click"
         if "click" in action:
-            print("Running click verification...")
+#            logging.warning("Running click verification...")
 
-            # apply the xml
-            get_xml(self.adb_connection)
-            xml_fp = f"{self.adb_connection.get_xml_dir()}/window_dump.xml"
-            xml_content = rule_based_extractor(xml_fp)
+            clickable_elements = self._extract_clickable_elements(state.ui_elements)
             click_check_prompt = f"""\
 You are an AI agent to help me decide the next action for interacting with an Android phone. Given the thought and action type, your job is to examine from interactive actions and choose the correct action according to the action type and thought.
 
@@ -846,12 +654,12 @@ You are an AI agent to help me decide the next action for interacting with an An
 click
 
 ## Interactive Actions
-{xml_content}
+{clickable_elements}
 
 Return the answer following the output format:
-Action: ...
+ ...
 """
-            # print(click_check_prompt)
+            # logging.warning(click_check_prompt)
             action_correct_start = time.time()
             action_response = self.general_sync_agent.chat.completions.create(
                 model="gpt-4o",
@@ -863,15 +671,15 @@ Action: ...
             step_time_duration += action_correct_duration
 
             action_response = action_response.choices[0].message.content.strip()
-            print(f"Corrected Action:\n{action_response}")
+            logging.warning(f"Corrected Action: {action_response}")
             try:
                 # extract the coordinates from model response
                 match = re.search(r"Action:\s*click,(\d+),(\d+)", action_response)
                 screen_x, screen_y = match.groups()
-                model_x, model_y = revert_coordinate(int(screen_x), int(screen_y))
+                model_x, model_y = self._revert_coordinate(int(screen_x), int(screen_y))
                 action = f"click(start_box='({model_x},{model_y})')"
             except:
-                print(
+                logging.warning(
                     "[Action verification and correction failed due to regex pattern error]"
                 )
 
@@ -881,7 +689,7 @@ Action: ...
 
         # post processing: verify the typing content
         elif "type" in action:
-            print(f"Running typing content verification...")
+            # logging.warning(f"Running typing content verification...")
 
             formatted_memory = "\n".join(
                 f"  {i+1}. {item}" for i, item in enumerate(self.history_image_memory)
@@ -923,7 +731,7 @@ Image Content Memory:
 Output Format:
 type(content='your corrected or enriched content here')
 """
-            print(f"Typing verifier template:\n{typing_content_prompt}\n")
+            logging.warning(f"Typing verifier template:\n{typing_content_prompt}\n")
 
             type_verifier_start = time.time()
             response = self.general_sync_agent.chat.completions.create(
@@ -939,9 +747,9 @@ type(content='your corrected or enriched content here')
                 match = re.search(r"type\(content='.*?'\)", action, re.DOTALL)
                 action = match.group(0)
             except:
-                print("[Typing content verification failed due to regex pattern error]")
+                logging.warning("[Typing content verification failed due to regex pattern error]")
 
-            print(f"Typing verifier corrected action:\n{action}\n")
+            logging.warning(f"Typing verifier corrected action: {action}")
 
             # update the prediction
             prediction = f"Thought: {thought}\nAction: {action}"
@@ -957,7 +765,7 @@ type(content='your corrected or enriched content here')
 
         # === parse and execute the action === #
         android_start_time = time.time()
-        success, action_name, error_msg = self.execute_action_env(action)
+        success, action_name, error_msg = self._execute_action_env(action)
         android_end_time = time.time()
         android_duration = android_end_time - android_start_time
         step_time_duration += android_duration
@@ -987,7 +795,7 @@ type(content='your corrected or enriched content here')
 
                 # update gradio history
                 new_message = f"Successfully executed {action_name} | Android execution time = {android_duration:.2f} s"
-                print(new_message)
+                logging.warning(new_message)
 
                 # append the thought and action for next iteration
                 self.messages.append(
@@ -1002,6 +810,6 @@ type(content='your corrected or enriched content here')
             new_message = f"Problem encountered when executing {action_name} (latency = {(android_end_time - android_start_time):.2f} s)"
         else:
             new_message = f"Exception due to {error_msg}."
-        print(new_message)
+        logging.warning(new_message)
         step_info["error"] = error_msg
         return base_agent.AgentInteractionResult(False, step_info)
